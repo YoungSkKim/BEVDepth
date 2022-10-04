@@ -7,8 +7,10 @@ from tqdm import tqdm
 
 def generate_info(nusc, scenes, max_cam_sweeps=6, max_lidar_sweeps=10):
     infos = list()
+    radar_idx = 0
     for cur_scene in tqdm(nusc.scene):
         if cur_scene['name'] not in scenes:
+            radar_idx += cur_scene['nbr_samples']
             continue
         first_sample_token = cur_scene['first_sample_token']
         cur_sample = nusc.get('sample', first_sample_token)
@@ -61,6 +63,7 @@ def generate_info(nusc, scenes, max_cam_sweeps=6, max_lidar_sweeps=10):
             cam_sweeps = [dict() for _ in range(max_cam_sweeps)]
             info['cam_infos'] = cam_infos
             info['lidar_infos'] = lidar_infos
+            info['radar_infos'] = radar_idx
             # for i in range(max_cam_sweeps):
             #     cam_sweeps.append(dict())
             for k, cam_data in enumerate(cam_datas):
@@ -129,7 +132,7 @@ def generate_info(nusc, scenes, max_cam_sweeps=6, max_lidar_sweeps=10):
             info['cam_sweeps'] = cam_sweeps
             info['lidar_sweeps'] = lidar_sweeps
             ann_infos = list()
-            if hasattr(cur_sample, 'anns'):
+            if 'anns' in cur_sample:
                 for ann in cur_sample['anns']:
                     ann_info = nusc.get('sample_annotation', ann)
                     velocity = nusc.box_velocity(ann_info['token'])
@@ -139,6 +142,7 @@ def generate_info(nusc, scenes, max_cam_sweeps=6, max_lidar_sweeps=10):
                     ann_infos.append(ann_info)
                 info['ann_infos'] = ann_infos
             infos.append(info)
+            radar_idx += 1
             if cur_sample['next'] == '':
                 break
             else:
@@ -152,16 +156,18 @@ def main():
                              verbose=True)
     train_scenes = splits.train
     val_scenes = splits.val
+    train_infos_of = generate_info(trainval_nusc, train_scenes[:2])
+    mmcv.dump(train_infos_of, './data/nuScenes/nuscenes_infos_train-of.pkl')
     train_infos = generate_info(trainval_nusc, train_scenes)
     val_infos = generate_info(trainval_nusc, val_scenes)
     mmcv.dump(train_infos, './data/nuScenes/nuscenes_infos_train.pkl')
     mmcv.dump(val_infos, './data/nuScenes/nuscenes_infos_val.pkl')
-    test_nusc = NuScenes(version='v1.0-test',
-                         dataroot='./data/nuScenes/',
-                         verbose=True)
-    test_scenes = splits.test
-    test_infos = generate_info(test_nusc, test_scenes)
-    mmcv.dump(test_infos, './data/nuScenes/nuscenes_infos_test.pkl')
+    # test_nusc = NuScenes(version='v1.0-test',
+    #                      dataroot='./data/nuScenes/',
+    #                      verbose=True)
+    # test_scenes = splits.test
+    # test_infos = generate_info(test_nusc, test_scenes)
+    # mmcv.dump(test_infos, './data/nuScenes/nuscenes_infos_test.pkl')
 
 
 if __name__ == '__main__':

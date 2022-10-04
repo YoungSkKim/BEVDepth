@@ -1,89 +1,103 @@
 # Copyright (c) Megvii Inc. All rights reserved.
 import torch
+import torch.nn.functional as F
 import torch.nn as nn
-from mmdet.models.backbones.resnet import BasicBlock
+from torch.cuda.amp.autocast_mode import autocast
 
 from ops.voxel_pooling import voxel_pooling
 
-from .base_lss_fpn import ASPP, BaseLSSFPN, Mlp, SELayer
+from .base_lss_fpn import BaseLSSFPN
 
-__all__ = ['FusionLSSFPN']
+__all__ = ['LSSFPNPts']
 
+class DepthAggregation(nn.Module):
+    """
+    pixel cloud feature extraction
+    """
+    def __init__(self, in_channels, mid_channels, out_channels):
+        super(DepthAggregation, self).__init__()
 
-class DepthNet(nn.Module):
-    def __init__(self, in_channels, mid_channels, context_channels,
-                 depth_channels):
-        super(DepthNet, self).__init__()
         self.reduce_conv = nn.Sequential(
             nn.Conv2d(in_channels,
                       mid_channels,
                       kernel_size=3,
                       stride=1,
-                      padding=1),
+                      padding=1,
+                      bias=False),
             nn.BatchNorm2d(mid_channels),
             nn.ReLU(inplace=True),
         )
-        self.context_conv = nn.Conv2d(mid_channels,
-                                      context_channels,
-                                      kernel_size=1,
-                                      stride=1,
-                                      padding=0)
-        self.mlp = Mlp(1, mid_channels, mid_channels)
-        self.se = SELayer(mid_channels)  # NOTE: add camera-aware
-        self.depth_gt_conv = nn.Sequential(
-            nn.Conv2d(1, mid_channels, kernel_size=1, stride=1),
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(mid_channels,
+                      mid_channels,
+                      kernel_size=3,
+                      stride=1,
+                      padding=1,
+                      bias=False),
+            nn.BatchNorm2d(mid_channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(mid_channels, mid_channels, kernel_size=1, stride=1),
+            nn.Conv2d(mid_channels,
+                      mid_channels,
+                      kernel_size=3,
+                      stride=1,
+                      padding=1,
+                      bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
         )
-        self.depth_conv = nn.Sequential(
-            BasicBlock(mid_channels, mid_channels),
-            BasicBlock(mid_channels, mid_channels),
-            BasicBlock(mid_channels, mid_channels),
-        )
-        self.aspp = ASPP(mid_channels, mid_channels)
-        self.depth_pred = nn.Conv2d(mid_channels,
-                                    depth_channels,
-                                    kernel_size=1,
-                                    stride=1,
-                                    padding=0)
 
-    def forward(self, x, mats_dict, lidar_depth, scale_depth_factor=1000.0):
+        self.out_conv = nn.Sequential(
+            nn.Conv2d(mid_channels,
+                      out_channels,
+                      kernel_size=3,
+                      stride=1,
+                      padding=1,
+                      bias=True),
+            # nn.BatchNorm3d(out_channels),
+            # nn.ReLU(inplace=True),
+        )
+
+    @autocast(False)
+    def forward(self, x):
         x = self.reduce_conv(x)
-        context = self.context_conv(x)
-        inv_intrinsics = torch.inverse(mats_dict['intrin_mats'][:, 0:1, ...])
-        pixel_size = torch.norm(torch.stack(
-            [inv_intrinsics[..., 0, 0], inv_intrinsics[..., 1, 1]], dim=-1),
-                                dim=-1).reshape(-1, 1)
-        aug_scale = torch.sqrt(mats_dict['ida_mats'][:, 0, :, 0, 0]**2 +
-                               mats_dict['ida_mats'][:, 0, :, 0,
-                                                     0]**2).reshape(-1, 1)
-        scaled_pixel_size = pixel_size * scale_depth_factor / aug_scale
-        x_se = self.mlp(scaled_pixel_size)[..., None, None]
-        x = self.se(x, x_se)
-        depth = self.depth_gt_conv(lidar_depth)
-        depth = self.depth_conv(x + depth)
-        depth = self.aspp(depth)
-        depth = self.depth_pred(depth)
-        return torch.cat([depth, context], dim=1)
+        x = self.conv(x)# + x
+        x = self.out_conv(x)
+        return x
 
 
-class FusionLSSFPN(BaseLSSFPN):
-    def _configure_depth_net(self, depth_net_conf):
-        return DepthNet(
-            depth_net_conf['in_channels'],
-            depth_net_conf['mid_channels'],
-            self.output_channels,
-            self.depth_channels,
-        )
+class LSSFPNPts(BaseLSSFPN):
+    def __init__(self, x_bound, y_bound, z_bound, d_bound, final_dim,
+                 downsample_factor, output_channels, img_backbone_conf,
+                 img_neck_conf, depth_net_conf):
+        super(LSSFPNPts, self).__init__(
+            x_bound, y_bound, z_bound, d_bound, final_dim,
+            downsample_factor, output_channels, img_backbone_conf,
+            img_neck_conf, depth_net_conf)
+        self.depth_aggregation_net = DepthAggregation(self.output_channels*2,
+                                                      self.output_channels*2,
+                                                      self.output_channels)
 
-    def _forward_depth_net(self, feat, mats_dict, lidar_depth):
-        return self.depth_net(feat, mats_dict, lidar_depth)
+
+    def _forward_voxel_net(self, img_feat_with_depth):
+        # BEVConv2D [n, c, d, h, w] -> [n, h, c, w, d]
+        img_feat_with_depth = img_feat_with_depth.permute(
+            0, 3, 1, 4, 2).contiguous()  # [n, c, d, h, w] -> [n, h, c, w, d]
+        n, h, c, w, d = img_feat_with_depth.shape
+        img_feat_with_depth = img_feat_with_depth.view(-1, c, w, d)
+        img_feat_with_depth = (
+            self.depth_aggregation_net(img_feat_with_depth).view(
+                n, h, c//2, w, d).permute(0, 2, 4, 1, 3).contiguous().float())
+        return img_feat_with_depth
+
+    def _forward_depth_net(self, feat, mats_dict):
+        return self.depth_net(feat, mats_dict)
 
     def _forward_single_sweep(self,
                               sweep_index,
                               sweep_imgs,
                               mats_dict,
-                              sweep_lidar_depth,
+                              sweep_ptss,
                               is_return_depth=False):
         """Forward function for single sweep.
 
@@ -112,23 +126,30 @@ class FusionLSSFPN(BaseLSSFPN):
         """
         batch_size, num_sweeps, num_cams, num_channels, img_height, \
             img_width = sweep_imgs.shape
+
         img_feats = self.get_cam_feats(sweep_imgs)
-        sweep_lidar_depth = sweep_lidar_depth.reshape(
-            batch_size * num_cams, *sweep_lidar_depth.shape[2:])
-        source_features = img_feats[:, 0, ...]
+        source_features = img_feats[:, 0, ...]  # [b, cams, 512, h, w]
         depth_feature = self._forward_depth_net(
             source_features.reshape(batch_size * num_cams,
                                     source_features.shape[2],
                                     source_features.shape[3],
                                     source_features.shape[4]),
             mats_dict,
-            sweep_lidar_depth)
-        depth = depth_feature[:, :self.depth_channels].softmax(1)
-        img_feat_with_depth = depth.unsqueeze(
-            1) * depth_feature[:, self.depth_channels:(
-                self.depth_channels + self.output_channels)].unsqueeze(2)
+        )
 
-        img_feat_with_depth = self._forward_voxel_net(img_feat_with_depth)
+        depth_pred = depth_feature[:, :self.depth_channels].softmax(1)  # [cams, bins(112), h, w]
+        image_feature = depth_feature[:, self.depth_channels:(self.depth_channels + self.output_channels)]
+        img_feat_with_depth_pred = depth_pred.unsqueeze(1) * image_feature.unsqueeze(2)  # [cams, context(80), bins(112), h, w]
+
+        depth_bin = self.create_depth_bin(sweep_ptss.contiguous())
+        depth_bin_pool = F.max_pool2d(depth_bin, (16, 1))
+        image_feature_pool = F.max_pool2d(image_feature, (16, 1))
+        img_feat_with_depth_bin = depth_bin_pool.unsqueeze(1) * image_feature_pool.unsqueeze(2)  # [cams, context(80), bins(112), h, w]
+        img_feat_with_depth_bin = img_feat_with_depth_bin.repeat(1, 1, 1, source_features.shape[3], 1)
+
+        img_feat_with_depth = torch.cat([img_feat_with_depth_pred, img_feat_with_depth_bin], dim=1)
+
+        img_feat_with_depth = self._forward_voxel_net(img_feat_with_depth)  # 2D conv to [nh, c, w, d]
 
         img_feat_with_depth = img_feat_with_depth.reshape(
             batch_size,
@@ -138,19 +159,20 @@ class FusionLSSFPN(BaseLSSFPN):
             img_feat_with_depth.shape[3],
             img_feat_with_depth.shape[4],
         )
-        geom_xyz = self.get_geometry(
+        geom_xyz = self.get_geometry(  # get xyz position given 'augmented' img coords: [b, cams, bins, h, w, 3(x,y,z)]
             mats_dict['sensor2ego_mats'][:, sweep_index, ...],
             mats_dict['intrin_mats'][:, sweep_index, ...],
             mats_dict['ida_mats'][:, sweep_index, ...],
             mats_dict.get('bda_mat', None),
         )
-        img_feat_with_depth = img_feat_with_depth.permute(0, 1, 3, 4, 5, 2)
+        img_feat_with_depth = img_feat_with_depth.permute(0, 1, 3, 4, 5, 2)  # to [b, cams, bins(112), h, w, context(80)]
         geom_xyz = ((geom_xyz - (self.voxel_coord - self.voxel_size / 2.0)) /
                     self.voxel_size).int()
-        feature_map = voxel_pooling(geom_xyz, img_feat_with_depth.contiguous(),
+        feature_map = voxel_pooling(geom_xyz, img_feat_with_depth.contiguous(),  # [b, context(80), W, H]
                                     self.voxel_num.cuda())
+
         if is_return_depth:
-            return feature_map.contiguous(), depth
+            return feature_map.contiguous(), depth_pred
         return feature_map.contiguous()
 
     def forward(self,
@@ -186,7 +208,6 @@ class FusionLSSFPN(BaseLSSFPN):
         """
         batch_size, num_sweeps, num_cams, num_channels, img_height, \
             img_width = sweep_imgs.shape
-        lidar_depth = self.get_downsampled_lidar_depth(lidar_depth)
         key_frame_res = self._forward_single_sweep(
             0,
             sweep_imgs[:, 0:1, ...],
@@ -215,24 +236,28 @@ class FusionLSSFPN(BaseLSSFPN):
         else:
             return torch.cat(ret_feature_list, 1)
 
-    def get_downsampled_lidar_depth(self, lidar_depth):
-        batch_size, num_sweeps, num_cams, height, width = lidar_depth.shape
-        lidar_depth = lidar_depth.view(
-            batch_size * num_sweeps * num_cams,
-            height // self.downsample_factor,
+    def create_depth_bin(self, gt_depths):
+        B, N, H, W = gt_depths.shape
+
+        gt_depths = (gt_depths -
+                     (self.d_bound[0] - self.d_bound[2])) / self.d_bound[2]
+        gt_depths = torch.where(
+            (gt_depths < self.depth_channels + 1) & (gt_depths >= 0.0),
+            gt_depths, torch.zeros_like(gt_depths))
+        gt_depths = F.one_hot(gt_depths.long(),
+                              num_classes=self.depth_channels + 1)[..., 1:]
+        gt_depths = gt_depths.view(
+            B * N,
+            H // self.downsample_factor,
             self.downsample_factor,
-            width // self.downsample_factor,
+            W // self.downsample_factor,
             self.downsample_factor,
-            1,
+            self.depth_channels,
         )
-        lidar_depth = lidar_depth.permute(0, 1, 3, 5, 2, 4).contiguous()
-        lidar_depth = lidar_depth.view(
-            -1, self.downsample_factor * self.downsample_factor)
-        gt_depths_tmp = torch.where(lidar_depth == 0.0, lidar_depth.max(),
-                                    lidar_depth)
-        lidar_depth = torch.min(gt_depths_tmp, dim=-1).values
-        lidar_depth = lidar_depth.view(batch_size, num_sweeps, num_cams, 1,
-                                       height // self.downsample_factor,
-                                       width // self.downsample_factor)
-        lidar_depth = lidar_depth / self.d_bound[1]
-        return lidar_depth
+        gt_depths = gt_depths.permute(0, 1, 3, 5, 2, 4).contiguous()
+        gt_depths = gt_depths.view(B * N,
+                                   H // self.downsample_factor, W // self.downsample_factor,
+                                   self.depth_channels, -1).sum(-1).clamp(max=1)
+        gt_depths = gt_depths.permute(0, 3, 1, 2).contiguous()
+
+        return gt_depths.float()

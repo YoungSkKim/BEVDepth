@@ -2,15 +2,19 @@ import mmcv
 logger = mmcv.utils.get_logger('mmdet')
 logger.setLevel('WARNING')
 
-from layers.backbones.fusion_lss_fpn import FusionLSSFPN
+import torch
+
+from layers.backbones.lss_fpn_radar import LSSFPNPts
+from layers.backbones.backbone_point import BackbonePoint
+from layers.fuser.conv_fuser import ConvFuser
 from layers.heads.bev_depth_head import BEVDepthHead
 
 from .base_bev_depth import BaseBEVDepth
 
-__all__ = ['FusionBEVDepth']
+__all__ = ['FusionBEVDepthPtsBEV']
 
 
-class FusionBEVDepth(BaseBEVDepth):
+class FusionBEVDepthPtsBEV(BaseBEVDepth):
     """Source code of `BEVDepth`, `https://arxiv.org/abs/2112.11790`.
 
     Args:
@@ -21,17 +25,20 @@ class FusionBEVDepth(BaseBEVDepth):
     """
 
     # TODO: Reduce grid_conf and data_aug_conf
-    def __init__(self, backbone_conf, head_conf, is_train_depth=False):
+    def __init__(self, backbone_conf, backbone_pts_conf, head_conf, is_train_depth=False):
         super(BaseBEVDepth, self).__init__()
-        self.backbone = FusionLSSFPN(**backbone_conf)
+        self.backbone = LSSFPNPts(**backbone_conf)
+        self.backbone_pts = BackbonePoint(**backbone_pts_conf)
+        self.fuser = ConvFuser([backbone_conf['output_channels']] + backbone_pts_conf['pts_neck']['out_channels'], 256)
         self.head = BEVDepthHead(**head_conf)
         self.is_train_depth = is_train_depth
 
     def forward(
         self,
-        x,
+        sweep_imgs,
         mats_dict,
-        lidar_depth,
+        pts_fv=None,
+        pts=None,
         timestamps=None,
     ):
         """Forward function for BEVDepth
@@ -59,10 +66,18 @@ class FusionBEVDepth(BaseBEVDepth):
             tuple(list[dict]): Output results for tasks.
         """
         if self.is_train_depth and self.training:
-            x = self.backbone(x, mats_dict, lidar_depth, timestamps)
+            x_img, depth_pred = self.backbone(sweep_imgs,
+                                              mats_dict,
+                                              pts_fv,
+                                              timestamps,
+                                              is_return_depth=True)
+            x_pts = self.backbone_pts(pts)
+            x = self.fuser([x_img, x_pts])
             preds = self.head(x)
-            return preds
+            return preds, depth_pred
         else:
-            x = self.backbone(x, mats_dict, lidar_depth, timestamps)
+            x_img = self.backbone(sweep_imgs, mats_dict, pts_fv, timestamps)
+            x_pts = self.backbone_pts(pts)
+            x = self.fuser([x_img, x_pts])
             preds = self.head(x)
             return preds

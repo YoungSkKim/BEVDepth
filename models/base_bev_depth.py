@@ -3,6 +3,10 @@ from torch import nn
 from layers.backbones.base_lss_fpn import BaseLSSFPN
 from layers.heads.bev_depth_head import BEVDepthHead
 
+import mmcv
+logger = mmcv.utils.get_logger('mmdet')
+logger.setLevel('WARNING')
+
 __all__ = ['BaseBEVDepth']
 
 

@@ -27,7 +27,6 @@ bev_neck_conf = dict(type='SECONDFPN',
                      upsample_strides=[2, 4, 8],
                      out_channels=[64, 64, 128])
 
-
 class BEVDepthHead(CenterHead):
     """Head for BevDepth.
 
@@ -267,6 +266,7 @@ class BEVDepthHead(CenterHead):
         """
         heatmaps, anno_boxes, inds, masks = targets
         return_loss = 0
+        return_loss_heatmap, return_loss_bbox = 0, 0
         for task_id, preds_dict in enumerate(preds_dicts):
             # heatmap focal loss
             preds_dict[0]['heatmap'] = clip_sigmoid(preds_dict[0]['heatmap'])
@@ -309,4 +309,6 @@ class BEVDepthHead(CenterHead):
                                        avg_factor=num)
             return_loss += loss_bbox
             return_loss += loss_heatmap
-        return return_loss
+            return_loss_bbox += loss_bbox
+            return_loss_heatmap += loss_heatmap
+        return return_loss, return_loss_heatmap, return_loss_bbox
